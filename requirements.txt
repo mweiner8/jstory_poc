@@ -1,0 +1,29 @@
+# Progress Tracker
+tqdm
+
+# Core LangChain packages (LCEL-based, no deprecated chains)
+langchain-core
+langchain-text-splitters
+langchain-community
+
+# Vector store
+langchain-chroma
+chromadb
+
+# Embeddings
+langchain-huggingface
+sentence-transformers
+huggingface-hub
+
+# OpenAI (optional, for enhanced responses)
+langchain-openai
+openai
+
+# Document processing
+pypdf
+
+# Web interface
+streamlit
+
+# Utilities
+tiktoken
