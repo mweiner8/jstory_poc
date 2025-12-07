@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import List, Tuple
 
-import fitz  # PyMuPDF  ->  pip install pymupdf
+import fitz #Don't add to requirements; covered by pymupdf
 from tqdm import tqdm
 
 from langchain_core.documents import Document
@@ -91,7 +91,7 @@ def strip_back_matter(text: str) -> str:
         pos = last.start()
 
         # Only consider this "back matter" if it appears in the back half of the book
-        if pos > n * 0.5 and pos < cutoff:
+        if n * 0.5 < pos < cutoff:
             cutoff = pos
 
     if cutoff < n:

@@ -141,7 +141,7 @@ def main() -> None:
             "Number of results",
             min_value=1,
             max_value=20,
-            value=5,
+            value=3, # Default; based on assignment requirement
             help="How many stories to retrieve",
         )
 
