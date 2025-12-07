@@ -3,19 +3,24 @@ Streamlit web application for story search using RAG.
 Run with: streamlit run app.py
 """
 
+import os
+import json
+
 import streamlit as st
 from rag_system import StoryRAGSystem
-import os
 
-# Page configuration
+# ------------------------------------------------------------
+# Page configuration + basic styling
+# ------------------------------------------------------------
+
 st.set_page_config(
-    page_title="Story Finder",
+    page_title="JStory RAG Explorer",
     page_icon="📚",
-    layout="wide"
+    layout="wide",
 )
 
-# Custom CSS
-st.markdown("""
+st.markdown(
+    """
     <style>
     .story-card {
         background-color: #f0f2f6;
@@ -40,193 +45,224 @@ st.markdown("""
         line-height: 1.6;
     }
     </style>
-""", unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True,
+)
 
-# Initialize session state
-if 'rag_system' not in st.session_state:
-    st.session_state.rag_system = None
-if 'search_results' not in st.session_state:
-    st.session_state.search_results = None
+# ------------------------------------------------------------
+# Session state
+# ------------------------------------------------------------
 
+if "rag_system" not in st.session_state:
+    st.session_state["rag_system"] = None
 
-def initialize_rag_system(api_key=None):
-    """Initialize the RAG system."""
-    try:
-        with st.spinner("Loading vector database and embeddings..."):
-            rag_system = StoryRAGSystem(
-                chroma_db_dir="./chroma_db",
-                collection_name="story_collection",
-                openai_api_key=api_key
-            )
-        st.session_state.rag_system = rag_system
-        return True
-    except Exception as e:
-        st.error(f"Error initializing system: {e}")
-        return False
+if "search_results" not in st.session_state:
+    st.session_state["search_results"] = None
 
 
-def display_story(story, index):
-    """Display a single story result."""
-    # ChromaDB returns distance (lower is better)
-    # Convert to similarity: typical distances are 0.3-1.5
-    distance = story['score']
-    similarity = max(0, min(100, (1.5 - distance) / 1.5 * 100))
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 
-    st.markdown(f"""
+def display_story(story: dict, index: int) -> None:
+    """Display a single story result with robust key handling."""
+    distance = story.get("score")
+    if distance is not None:
+        similarity = story.get(
+            "similarity_pct",
+            max(0, min(100, (1.5 - distance) / 1.5 * 100)),
+        )
+    else:
+        similarity = story.get("similarity_pct", 0.0)
+
+    title = (
+        story.get("title")
+        or story.get("story_title")
+        or "Untitled story"
+    )
+
+    book = (
+        story.get("book")
+        or story.get("book_name")
+        or "Unknown book"
+    )
+
+    page = story.get("page")
+    page_display = page if page not in (None, "", -1) else "?"
+
+    content = story.get("content", "")
+
+    st.markdown(
+        f"""
         <div class="story-card">
             <div class="story-title">
-                {index}. {story['title']}
+                {index}. {title}
             </div>
             <div class="story-meta">
-                📖 Book: {story['book']} | 📄 Page: {story['page']} | 🎯 Similarity: {similarity:.1f}%
+                📖 Book: {book} | 📄 Page: {page_display} | 🎯 Similarity: {similarity:.1f}%
             </div>
             <div class="story-content">
-                {story['content'][:500]}{"..." if len(story['content']) > 500 else ""}
+                {content[:500]}{"..." if len(content) > 500 else ""}
             </div>
         </div>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
-    with st.expander("View full content"):
-        st.write(story['content'])
+    with st.expander("View full story text"):
+        st.write(content)
 
 
-def main():
-    """Main application."""
+# ------------------------------------------------------------
+# Main app
+# ------------------------------------------------------------
 
-    # Header
-    st.title("📚 Story Finder")
-    st.markdown("### Find the perfect story using AI-powered search")
+def main() -> None:
+    st.title("📚 JStory RAG Explorer")
+    st.markdown(
+        "Type a theme, topic, or question, and I'll search your PDF-based story "
+        "collection using embeddings + a vector database."
+    )
 
-    # Sidebar
+    # ---------------- Sidebar: settings ----------------
     with st.sidebar:
         st.header("⚙️ Settings")
 
-        # OpenAI API Key (optional)
-        st.markdown("#### OpenAI API Key (Optional)")
-        st.caption("For enhanced explanations. Leave empty for basic search.")
-        api_key = st.text_input(
-            "API Key",
+        default_key = os.getenv("OPENAI_API_KEY", "")
+
+        openai_key_input = st.text_input(
+            "OpenAI API Key (optional)",
             type="password",
-            value=os.getenv("OPENAI_API_KEY", ""),
-            help="Optional: Add OpenAI API key for AI-generated explanations"
+            value=default_key,
+            help="For AI explanations and QA. Leave empty for retrieval-only search.",
         )
 
-        # Number of results
-        num_results = st.slider(
+        top_k = st.slider(
             "Number of results",
             min_value=1,
-            max_value=10,
-            value=3,
-            help="How many stories to retrieve"
+            max_value=20,
+            value=5,
+            help="How many stories to retrieve",
         )
 
-        # Initialize button
-        if st.button("🔄 Initialize System", type="primary"):
-            initialize_rag_system(api_key if api_key else None)
+        debug_mode = st.checkbox(
+            "Debug mode: print prompts to console",
+            value=False,
+        )
+
+        init_clicked = st.button("🔄 Initialize / Reload System", type="primary")
 
         st.markdown("---")
-
-        # Info
         st.markdown("#### About")
         st.info(
             "This app uses RAG (Retrieval-Augmented Generation) "
             "to find stories matching your query from a collection "
-            "of books stored in a vector database."
+            "of books stored in a Chroma vector database."
         )
 
         st.markdown("#### Tech Stack")
-        st.markdown("""
-        - **LangChain**: RAG orchestration
-        - **ChromaDB**: Vector database
-        - **HuggingFace**: Embeddings
-        - **Streamlit**: Web interface
-        """)
+        st.markdown(
+            """
+            - **LangChain**: RAG orchestration  
+            - **ChromaDB**: Vector database  
+            - **HuggingFace**: Embeddings  
+            - **OpenAI** (optional): Explanations & QA  
+            - **Streamlit**: Web interface
+            """
+        )
 
-    # Main content
-    if st.session_state.rag_system is None:
-        st.info("👈 Click 'Initialize System' in the sidebar to get started")
-
-        st.markdown("""
-        ### How it works:
-        1. **Initialize** the system (loads the vector database)
-        2. **Enter** a query describing the story you're looking for
-        3. **Get** the top matching stories from the collection
-
-        ### Example queries:
-        - "adventure story with a brave hero"
-        - "fairy tale about kindness"
-        - "mystery involving a detective"
-        - "story about friendship and loyalty"
-        """)
+    # ---------------- RAG system init / update ----------------
+    if init_clicked or st.session_state["rag_system"] is None:
+        try:
+            with st.spinner("Loading vector database and embeddings..."):
+                st.session_state["rag_system"] = StoryRAGSystem(
+                    persist_directory="./chroma_db",
+                    collection_name="story_collection",
+                    openai_api_key=openai_key_input or None,
+                    debug=debug_mode,
+                )
+        except Exception as e:
+            st.session_state["rag_system"] = None
+            st.error(f"Error initializing system: {e}")
+            return
     else:
-        # Search interface
-        st.markdown("### 🔍 Search for Stories")
+        # Live update key + debug on existing system
+        system = st.session_state["rag_system"]
+        system.update_openai_key(openai_key_input or None)
+        system.set_debug(debug_mode)
 
-        col1, col2 = st.columns([4, 1])
+    system: StoryRAGSystem = st.session_state["rag_system"]
 
-        with col1:
-            query = st.text_input(
-                "What kind of story are you looking for?",
-                placeholder="e.g., adventure story with dragons...",
-                label_visibility="collapsed"
-            )
+    # ---------------- Main content ----------------
+    st.markdown("### 🔍 Search for Stories")
 
-        with col2:
-            search_button = st.button("Search", type="primary", use_container_width=True)
+    col1, col2 = st.columns([4, 1])
+    with col1:
+        query = st.text_input(
+            "Search query or question",
+            placeholder="e.g. 'honesty', 'keeping Shabbos at work', 'jealousy', ...",
+            label_visibility="collapsed",
+        )
+    with col2:
+        search_clicked = st.button("Search", type="primary", use_container_width=True)
 
-        # Example queries
-        st.caption("**Example queries:** adventure story, fairy tale, mystery, friendship")
+    st.caption(
+        "**Example queries:** honesty, jealousy, Shabbos at work, "
+        "teshuvah, emunah, friendship, bitachon"
+    )
 
-        # Perform search
-        if search_button and query:
-            with st.spinner("Searching through stories..."):
-                try:
-                    # Get results with context if OpenAI is available
-                    if st.session_state.rag_system.llm_available:
-                        results = st.session_state.rag_system.get_story_with_context(query, k=num_results)
-                        st.session_state.search_results = results
-                    else:
-                        stories = st.session_state.rag_system.search_stories(query, k=num_results)
-                        st.session_state.search_results = {
-                            'query': query,
-                            'stories': stories,
-                            'explanation': None
-                        }
-                except Exception as e:
-                    st.error(f"Search error: {e}")
+    if not query.strip():
+        if st.session_state["search_results"] is None:
+            st.info("Enter a search query above to get started.")
+        search_clicked = False
 
-        # Display results
-        if st.session_state.search_results:
-            results = st.session_state.search_results
+    if search_clicked and query.strip():
+        with st.spinner("Searching stories..."):
+            try:
+                if system.has_llm:
+                    raw = system.get_story_with_context(query, k=top_k)
+                    results = {"query": query, **raw}
+                else:
+                    stories = system.search_stories(query, k=top_k)
+                    results = {
+                        "query": query,
+                        "stories": stories,
+                        "explanation": None,
+                    }
+                st.session_state["search_results"] = results
+            except Exception as e:
+                st.error(f"Search error: {e}")
 
-            st.markdown("---")
-            st.markdown(f"### Results for: *\"{results['query']}\"*")
+    # ---------------- Results display ----------------
+    results = st.session_state["search_results"]
+    if results:
+        st.markdown("---")
+        st.markdown(f"### Results for: *\"{results['query']}\"*")
 
-            # Show AI explanation if available
-            if results.get('explanation'):
-                st.info(f"💡 {results['explanation']}")
+        explanation = results.get("explanation")
+        if explanation:
+            st.subheader("Why these stories?")
+            st.write(explanation)
 
-            st.markdown(f"Found **{len(results['stories'])}** matching stories:")
+        stories = results.get("stories") or []
+        st.subheader(f"Top {len(stories)} matching stories")
 
-            # Display each story
-            for i, story in enumerate(results['stories'], 1):
+        if not stories:
+            st.warning("No stories were retrieved from the vector database.")
+        else:
+            for i, story in enumerate(stories, 1):
                 display_story(story, i)
 
-            # Download results option
+            # JSON export
             st.markdown("---")
-            if st.button("📥 Export Results"):
-                import json
-                results_json = json.dumps(results, indent=2)
-                st.download_button(
-                    label="Download as JSON",
-                    data=results_json,
-                    file_name="story_search_results.json",
-                    mime="application/json"
-                )
-
-        # Show sample search if no results yet
-        elif query == "":
-            st.info("💡 Enter a search query above to find matching stories!")
+            exportable_results = stories
+            json_str = json.dumps(exportable_results, ensure_ascii=False, indent=2)
+            st.download_button(
+                label="📥 Download results as JSON",
+                file_name="jstory_results.json",
+                mime="application/json",
+                data=json_str,
+            )
 
 
 if __name__ == "__main__":

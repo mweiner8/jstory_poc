@@ -1,236 +1,404 @@
-"""
-Script to process story PDFs and create a ChromaDB vector database.
-Run this once to set up your database.
-"""
-
 import os
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-from typing import List
+import re
+import logging
+from pathlib import Path
+from typing import List, Tuple
+
+import fitz  # PyMuPDF  ->  pip install pymupdf
 from tqdm import tqdm
-import json
 
-# Configuration
-PDF_DIRECTORY = "./story_pdfs"  # Put your PDF files here
-CHROMA_DB_DIR = "./chroma_db"   # Vector database will be saved here
-COLLECTION_NAME = "story_collection"
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
-# Story metadata file (optional - for better organization)
-METADATA_FILE = "./story_metadata.json"
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+# ------------------------------------------------------------
+# Heuristics: headers / back-matter
+# ------------------------------------------------------------
+
+HEADER_PATTERNS = [
+    r"^\d+\s+TALES AND\s*LEGENDS",
+    r"^TALES AND\s*LEGENDS\b",
+    r"^ANIMAL TALES\b",
+    r"^PROVERBS ANDFOLK SAYINGS\b",
+    r"^PROVERBS ANDRIDDLES\b",
+    r"^FOLKQUIPS\b",
+    r"^RIDDLES\b",
+    r"^NOTES\b",
+    r"^GLOSSARY\b",
+    r"^INDEX\b",
+]
+
+_HEADER_REGEXES = [re.compile(p, re.IGNORECASE) for p in HEADER_PATTERNS]
+
+
+def looks_like_running_header(line: str) -> bool:
+    """Detect page headers / section labels we don't want as story titles."""
+    s = line.strip()
+    if not s:
+        return False
+
+    # Explicit known headers
+    if any(rx.match(s) for rx in _HEADER_REGEXES):
+        return True
+
+    # All caps + trailing page number (very generic book header pattern)
+    if re.search(r"[a-z]", s) is None and re.search(r"\b\d{2,4}\b$", s):
+        return True
+
+    return False
+
+
+BACK_MATTER_MARKERS = [
+    r"\nNOTES\b",
+    r"\nGLOSSARY\b",
+    r"\nINDEX\b",
+    r"\nTheJewish Bookshelf\b",
+    r"\nHerearetheBooks thatExplore\b",
+]
+
+
+def strip_back_matter(text: str) -> str:
+    """
+    Remove NOTES / GLOSSARY / INDEX / publisher ads from the tail of the book.
+
+    Safer heuristic:
+    - For each marker, look for the **last** occurrence.
+    - Only treat it as back-matter if it is in the **back half** of the text.
+    - Cut at the earliest such 'last occurrence' among all markers.
+    """
+    n = len(text)
+    cutoff = n
+
+    for pat in BACK_MATTER_MARKERS:
+        matches = list(re.finditer(pat, text, flags=re.IGNORECASE))
+        if not matches:
+            continue
+
+        last = matches[-1]
+        pos = last.start()
+
+        # Only consider this "back matter" if it appears in the back half of the book
+        if pos > n * 0.5 and pos < cutoff:
+            cutoff = pos
+
+    if cutoff < n:
+        logger.info(
+            "Stripping back matter starting at char %d of %d (~%.1f%% of book)",
+            cutoff,
+            n,
+            100 * cutoff / max(n, 1),
+        )
+        return text[:cutoff]
+
+    return text
+
+
+# ------------------------------------------------------------
+# PDF loading / cleaning with PyMuPDF (fitz)
+# ------------------------------------------------------------
+
+def extract_page_text_fitz(page: "fitz.Page") -> str:
+    """
+    Extract text from a page using word coordinates and rebuild lines
+    with proper spacing.
+    """
+    # words: [x0, y0, x1, y1, "text", block_no, line_no, word_no]
+    words = page.get_text("words")
+    if not words:
+        return ""
+
+    # Group words by (block_no, line_no)
+    lines_by_key = {}
+    for x0, y0, x1, y1, txt, block_no, line_no, word_no in words:
+        key = (block_no, line_no)
+        lines_by_key.setdefault(key, []).append((x0, txt))
+
+    # Sort lines in reading order: by block, then line
+    sorted_lines = sorted(lines_by_key.items(), key=lambda kv: (kv[0][0], kv[0][1]))
+
+    text_lines = []
+    for (_block, _line), items in sorted_lines:
+        # sort words left-to-right
+        items.sort(key=lambda t: t[0])
+        words_only = [w for _, w in items]
+
+        # join words with a space; this is what fixes the smashed-together problem
+        line_text = " ".join(words_only).strip()
+        if line_text:
+            text_lines.append(line_text)
+
+    # join lines with newline
+    return "\n".join(text_lines)
+
+
+def extract_pdf_text_fitz(pdf_path: str) -> str:
+    """
+    Read a whole PDF with PyMuPDF and return raw text with
+    reasonable line breaks and spaces.
+    """
+    doc = fitz.open(pdf_path)
+    pages_text = []
+
+    for page in doc:
+        page_text = extract_page_text_fitz(page)
+        if page_text:
+            pages_text.append(page_text)
+
+    # Separate pages with a blank line so your splitter can see boundaries
+    full_text = "\n\n".join(pages_text)
+    return full_text.strip()
 
 
 def clean_pdf_text(text: str) -> str:
-    """Clean up PDF extraction issues."""
-    import re
+    """
+    Clean raw text but **preserve newlines** so that:
+      - story titles can be inferred from first lines
+      - text splitter separators on '\n\n' etc. still work
+    """
+    if not text:
+        return ""
 
-    # Fix missing spaces between words (common PDF issue)
-    # Insert space before capital letters in middle of "words"
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    # Normalize spaces / tabs inside lines
+    text = re.sub(r"[ \t]+", " ", text)
 
-    # Fix missing spaces after punctuation
-    text = re.sub(r'([.!?,;:])([A-Za-z])', r'\1 \2', text)
+    # Normalize crazy sequences of blank lines
+    # 3+ newlines -> exactly 2
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Remove excessive whitespace
-    text = re.sub(r'\s+', ' ', text)
+    # Strip trailing spaces on each line
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned = "\n".join(lines)
 
-    return text.strip()
+    # Final trim
+    return cleaned.strip()
 
 
-def load_pdfs_from_directory(directory: str) -> List:
-    """Load all PDFs from a directory."""
-    documents = []
+def load_pdfs_from_directory(pdf_dir: str) -> List[Tuple[str, str]]:
+    """
+    Return list of (file_path, cleaned_text) for every PDF in the directory,
+    using PyMuPDF (fitz) for extraction.
+    If one PDF fails, log and continue (don't bail out).
+    """
+    pdf_dir_path = Path(pdf_dir)
+    if not pdf_dir_path.exists():
+        logger.error("PDF directory '%s' does not exist.", pdf_dir)
+        return []
 
-    if not os.path.exists(directory):
-        os.makedirs(directory)
-        print(f"Created directory: {directory}")
-        print(f"Please add your PDF files to {directory} and run again.")
-        return documents
-
-    pdf_files = [f for f in os.listdir(directory) if f.endswith('.pdf')]
-
+    pdf_files = sorted(pdf_dir_path.glob("*.pdf"))
     if not pdf_files:
-        print(f"No PDF files found in {directory}")
-        return documents
+        logger.warning("No PDFs found in '%s'.", pdf_dir)
+        return []
 
-    print(f"Found {len(pdf_files)} PDF files")
+    results: List[Tuple[str, str]] = []
 
-    for pdf_file in pdf_files:
-        pdf_path = os.path.join(directory, pdf_file)
-        print(f"Loading: {pdf_file}")
+    logger.info("Found %d PDF files in '%s'", len(pdf_files), pdf_dir)
 
+    for pdf_path in pdf_files:
         try:
-            loader = PyPDFLoader(pdf_path)
-            docs = loader.load()
+            logger.info("Reading (fitz) %s", pdf_path.name)
+            raw_text = extract_pdf_text_fitz(str(pdf_path))
+            cleaned_text = clean_pdf_text(raw_text)
+            cleaned_text = strip_back_matter(cleaned_text)
 
-            for doc in docs:
-                doc.page_content = clean_pdf_text(doc.page_content)
-                doc.metadata['source_file'] = pdf_file
-                doc.metadata['book_name'] = pdf_file.replace('.pdf', '')
+            if cleaned_text:
+                results.append((str(pdf_path), cleaned_text))
+            else:
+                logger.warning("No extractable text in '%s'", pdf_path.name)
 
-            documents.extend(docs)
-            print(f"  Loaded {len(docs)} pages from {pdf_file}")
-        except Exception as e:
-            print(f"  Error loading {pdf_file}: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.error("Error loading '%s' with fitz: %s", pdf_path.name, e)
 
+    logger.info("Successfully loaded text from %d/%d PDFs", len(results), len(pdf_files))
+    return results
+
+
+# ------------------------------------------------------------
+# Chunking into story-ish segments
+# ------------------------------------------------------------
+
+def _guess_book_name_from_path(path_str: str) -> str:
+    """Best-effort guess a human-ish book name from file name."""
+    stem = Path(path_str).stem
+    stem = stem.replace("_", " ").replace("-", " ")
+    return stem.title()
+
+
+def _infer_story_title(chunk_text: str, book_name: str, index: int) -> str:
+    """
+    Heuristic:
+    - Scan top non-empty lines, skipping obvious headers
+    - If a line is short, capitalized, and not clearly mid-sentence, treat as title
+    - Otherwise fall back to 'Book Name – Story segment N'
+    """
+    lines = [line.strip() for line in chunk_text.splitlines() if line.strip()]
+    if not lines:
+        return f"{book_name} – Story segment {index + 1}"
+
+    for candidate in lines:
+        # skip page headers / section labels
+        if looks_like_running_header(candidate):
+            continue
+
+        # too long → probably body text, not a title
+        if len(candidate) > 80:
+            continue
+
+        # avoid obvious mid-sentence stuff
+        if candidate[0].islower():
+            continue
+        if candidate.endswith((",", ";")):
+            continue
+
+        # if it has a comma in the middle but doesn't look like a clean phrase, skip
+        if "," in candidate and not candidate.endswith((".", "!", "?", ":", ";", ",")):
+            continue
+
+        return candidate
+
+    # fallback
+    return f"{book_name} – Story segment {index + 1}"
+
+
+def build_story_documents(pdf_texts: List[Tuple[str, str]]) -> List[Document]:
+    """
+    Turn (file_path, text) pairs into a list of LangChain Documents
+    with useful metadata: book_name, story_title, source_file, etc.
+    Includes verbose logging so you can see chunking in real time.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100,
+        separators=["\n\n\n", "\n\n", "\n", " ", ""],
+    )
+
+    documents: List[Document] = []
+    chunk_counter = 0
+
+    for file_path, text in pdf_texts:
+        book_name = _guess_book_name_from_path(file_path)
+
+        chunks = splitter.split_text(text)
+        logger.info(
+            "Split '%s' into %d chunks", Path(file_path).name, len(chunks)
+        )
+
+        for idx, chunk in enumerate(chunks):
+            story_title = _infer_story_title(chunk, book_name, idx)
+
+            # DEBUG: show chunk content and title guess
+            logger.info(
+                "  [Chunk %d] %d chars | title guess: %r",
+                chunk_counter,
+                len(chunk),
+                story_title,
+            )
+            logger.info("-" * 40)
+            preview = chunk[:500].replace("\n", " ")
+            logger.info("%s", preview)
+            logger.info("-" * 40)
+
+            metadata = {
+                "source_file": str(Path(file_path).name),
+                "book_name": book_name,
+                "story_title": story_title,
+                # page is approximate / unknown at this level
+                "page": None,
+                "chunk_id": idx,
+            }
+
+            documents.append(Document(page_content=chunk, metadata=metadata))
+            chunk_counter += 1
+
+    logger.info("Built %d total chunks from %d PDFs", len(documents), len(pdf_texts))
     return documents
 
 
-def extract_story_metadata(doc):
-    """Extract story titles and improve metadata."""
-    content = doc.page_content.strip()
-    lines = [line.strip() for line in content.split('\n') if line.strip()]
+# ------------------------------------------------------------
+# Vector DB creation
+# ------------------------------------------------------------
 
-    if not lines:
-        return "Untitled"
-
-    # Look for title patterns in first few lines
-    for line in lines[:5]:
-        # Skip page numbers, headers, footers
-        if line.isdigit() or len(line) < 10:
-            continue
-
-        # Skip lines that are all caps (likely headers)
-        if line.isupper() and len(line) > 20:
-            continue
-
-        # Good title candidate: reasonable length, starts with capital
-        if 10 < len(line) < 150 and line[0].isupper():
-            # Check if it looks like a sentence vs title
-            if not line.endswith('.') or len(line) < 50:
-                return line
-
-    # Fallback: return first non-empty line, truncated
-    return lines[0][:100] if lines else "Untitled"
-
-
-def split_documents_into_stories(documents: List, metadata_file: str = None) -> List:
+def create_vector_database(
+    pdf_dir: str = "story_pdfs",
+    persist_directory: str = "chroma_db",
+    collection_name: str = "story_collection",
+    embedding_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 100,
+) -> Chroma:
     """
-    Split documents into story-sized chunks.
-
-    If you have a metadata JSON file with story boundaries, use it.
-    Otherwise, use intelligent text splitting.
+    End-to-end:
+    - load and clean PDFs (with fitz)
+    - strip back-matter (safely)
+    - chunk into Documents (with debug logging)
+    - embed and persist to a Chroma collection
     """
+    logger.info("Starting PDF ingestion from '%s'", pdf_dir)
+    pdf_texts = load_pdfs_from_directory(pdf_dir)
+    if not pdf_texts:
+        raise RuntimeError("No usable PDFs found; aborting vector DB creation.")
 
-    # Option 1: If you have story metadata (recommended)
-    if metadata_file and os.path.exists(metadata_file):
-        print("Using metadata file for story boundaries")
-        with open(metadata_file, 'r') as f:
-            story_metadata = json.load(f)
-        # Implementation depends on your metadata structure
-        # This is a placeholder - customize based on your needs
+    documents = build_story_documents(pdf_texts)
 
-    # Option 2: Intelligent text splitting (default)
-    print("Splitting documents into story-sized chunks")
-
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100,
-        separators=["\n\n\n", "\n\n", "\n", ". ", " ", ""],
-        length_function=len,
-    )
-
-    split_docs = text_splitter.split_documents(documents)
-
-    # Add chunk metadata
-    for i, doc in enumerate(split_docs):
-        doc.metadata['chunk_id'] = i
-        if 'story_title' not in doc.metadata:
-            doc.metadata['story_title'] = extract_story_metadata(doc)
-
-    return split_docs
-
-
-def create_vector_database(documents: List, persist_directory: str, collection_name: str):
-    """Create and persist ChromaDB vector database."""
-
-    print(f"\nCreating embeddings for {len(documents)} document chunks...")
-    print("This may take a few minutes depending on the corpus size...")
-
-    # Use HuggingFace embeddings with batch processing
+    # Single, explicit embedding model config (no double-loading).
     embeddings = HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'},
-        encode_kwargs={
-            'normalize_embeddings': True,
-            'batch_size': 32
-        }
+        model_name=embedding_model_name,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
     )
 
-    # Process in batches to show progress
-    batch_size = 100
-    print(f"Processing in batches of {batch_size}...")
+    # Wipe and recreate persist directory to avoid stale / duplicate data.
+    persist_path = Path(persist_directory)
+    if persist_path.exists():
+        logger.info("Clearing existing Chroma directory '%s'", persist_directory)
+        for child in persist_path.iterdir():
+            if child.is_file():
+                child.unlink()
+            else:
+                for root, dirs, files in os.walk(child, topdown=False):
+                    for name in files:
+                        Path(root, name).unlink()
+                    for name in dirs:
+                        Path(root, name).rmdir()
+                child.rmdir()
+    else:
+        persist_path.mkdir(parents=True, exist_ok=True)
 
-    for i in range(0, len(documents), batch_size):
-        batch = documents[i:i + batch_size]
-        print(f"Processing chunks {i + 1}-{min(i + batch_size, len(documents))} of {len(documents)}")
+    logger.info(
+        "Creating Chroma collection '%s' at '%s'",
+        collection_name,
+        persist_directory,
+    )
 
-        if i == 0:
-            # Create initial database
-            print("Generating embeddings with progress tracking...")
-            vectordb = Chroma.from_documents(
-                documents=tqdm(documents, desc="Embedding chunks"),
-                embedding=embeddings,
-                persist_directory=persist_directory,
-                collection_name=collection_name
-            )
-        else:
-            # Add to existing database
-            vectordb.add_documents(batch)
+    vectordb = Chroma(
+        persist_directory=persist_directory,
+        collection_name=collection_name,
+        embedding_function=embeddings,
+    )
 
-    print(f"\nVector database created successfully!")
-    print(f"Location: {persist_directory}")
-    print(f"Total documents: {len(documents)}")
+    # Proper batching: we only embed + add each chunk once
+    for start in tqdm(
+        range(0, len(documents), batch_size),
+        desc="Adding documents to Chroma",
+    ):
+        batch = documents[start:start + batch_size]
+        vectordb.add_documents(batch)
 
+    vectordb.persist()
+    logger.info("Vector DB created with %d documents.", len(documents))
     return vectordb
 
-def main():
-    """Main execution function."""
-
-    print("=" * 60)
-    print("Story Collection Vector Database Creator")
-    print("=" * 60)
-
-    # Step 1: Load PDFs
-    print("\n[Step 1] Loading PDF files...")
-    documents = load_pdfs_from_directory(PDF_DIRECTORY)
-
-    if not documents:
-        print("\nNo documents to process. Exiting.")
-        return
-
-    print(f"Total pages loaded: {len(documents)}")
-
-    # Step 2: Split into stories
-    print("\n[Step 2] Processing documents into story chunks...")
-    story_chunks = split_documents_into_stories(documents, METADATA_FILE)
-
-    print(f"Total story chunks created: {len(story_chunks)}")
-
-    # Step 3: Create vector database
-    print("\n[Step 3] Creating vector database...")
-    vectordb = create_vector_database(
-        story_chunks,
-        CHROMA_DB_DIR,
-        COLLECTION_NAME
-    )
-
-    # Test the database
-    print("\n[Step 4] Testing database with sample query...")
-    test_query = "adventure story"
-    results = vectordb.similarity_search(test_query, k=3)
-
-    print(f"\nTest query: '{test_query}'")
-    print(f"Found {len(results)} results")
-    for i, result in enumerate(results, 1):
-        print(f"\nResult {i}:")
-        print(f"  Source: {result.metadata.get('source_file', 'Unknown')}")
-        print(f"  Preview: {result.page_content[:150]}...")
-
-    print("\n" + "=" * 60)
-    print("Setup complete! You can now run the Streamlit app.")
-    print("=" * 60)
 
 if __name__ == "__main__":
-    main()
+    create_vector_database()

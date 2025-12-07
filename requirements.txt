@@ -2,6 +2,7 @@
 tqdm
 
 # Core LangChain packages (LCEL-based, no deprecated chains)
+langchain
 langchain-core
 langchain-text-splitters
 langchain-community
@@ -20,7 +21,8 @@ langchain-openai
 openai
 
 # Document processing
-pypdf
+PyPDF2
+pymupdf
 
 # Web interface
 streamlit
