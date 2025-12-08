@@ -1,8 +1,4 @@
-# Progress Tracker
-tqdm
-
-# Core LangChain packages (LCEL-based, no deprecated chains)
-langchain
+# Core LangChain - only what we need
 langchain-core
 langchain-text-splitters
 langchain-community
@@ -11,21 +7,22 @@ langchain-community
 langchain-chroma
 chromadb
 
-# Embeddings
+# Embeddings - lighter model support
 langchain-huggingface
 sentence-transformers
-huggingface-hub
 
-# OpenAI (optional, for enhanced responses)
+# OpenAI (optional, only loads if API key provided)
 langchain-openai
 openai
 
-# Document processing
-PyPDF2
+# Document processing - ONLY pymupdf (PyPDF2 removed)
 pymupdf
 
 # Web interface
 streamlit
 
-# Utilities
+# Progress bar
+tqdm
+
+# Utilities (required by OpenAI)
 tiktoken
