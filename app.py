@@ -10,6 +10,40 @@ import streamlit as st
 from rag_system import StoryRAGSystem
 
 # ------------------------------------------------------------
+# PRE-LOAD: Initialize RAG system BEFORE any Streamlit UI
+# This ensures the system loads during startup, not on first user click
+# ------------------------------------------------------------
+
+@st.cache_resource
+def load_rag_system():
+    """Load RAG system once and cache it across all sessions."""
+    print("🔄 Initializing RAG system...", flush=True)
+    try:
+        system = StoryRAGSystem(
+            persist_directory="./chroma_db",
+            collection_name="story_collection",
+            openai_api_key=None,  # Will be updated later if provided
+            debug=False,
+        )
+        print("✅ RAG system initialized successfully!", flush=True)
+        return system
+    except Exception as ex:
+        print(f"❌ Failed to initialize RAG system: {ex}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return None
+
+# Load system at startup (outside any Streamlit widgets)
+try:
+    GLOBAL_RAG_SYSTEM = load_rag_system()
+    if GLOBAL_RAG_SYSTEM is None:
+        st.error("⚠️ Failed to load RAG system. Check Render logs for details.")
+        st.stop()
+except Exception as e:
+    st.error(f"⚠️ Critical error loading RAG system: {e}")
+    st.stop()
+
+# ------------------------------------------------------------
 # Page configuration + basic styling
 # ------------------------------------------------------------
 
@@ -52,9 +86,6 @@ st.markdown(
 # ------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------
-
-if "rag_system" not in st.session_state:
-    st.session_state["rag_system"] = None
 
 if "search_results" not in st.session_state:
     st.session_state["search_results"] = None
@@ -124,6 +155,9 @@ def main() -> None:
         "collection using embeddings + a vector database."
     )
 
+    # Get the cached system
+    system = GLOBAL_RAG_SYSTEM
+
     # ---------------- Sidebar: settings ----------------
     with st.sidebar:
         st.header("⚙️ Settings")
@@ -141,7 +175,7 @@ def main() -> None:
             "Number of results",
             min_value=1,
             max_value=20,
-            value=3, # Default; based on assignment requirement
+            value=3,
             help="How many stories to retrieve",
         )
 
@@ -150,7 +184,9 @@ def main() -> None:
             value=False,
         )
 
-        init_clicked = st.button("🔄 Initialize / Reload System", type="primary")
+        # Update system settings
+        system.update_openai_key(openai_key_input or None)
+        system.set_debug(debug_mode)
 
         st.markdown("---")
         st.markdown("#### About")
@@ -170,28 +206,6 @@ def main() -> None:
             - **Streamlit**: Web interface
             """
         )
-
-    # ---------------- RAG system init / update ----------------
-    if init_clicked or st.session_state["rag_system"] is None:
-        try:
-            with st.spinner("Loading vector database and embeddings..."):
-                st.session_state["rag_system"] = StoryRAGSystem(
-                    persist_directory="./chroma_db",
-                    collection_name="story_collection",
-                    openai_api_key=openai_key_input or None,
-                    debug=debug_mode,
-                )
-        except Exception as e:
-            st.session_state["rag_system"] = None
-            st.error(f"Error initializing system: {e}")
-            return
-    else:
-        # Live update key + debug on existing system
-        system = st.session_state["rag_system"]
-        system.update_openai_key(openai_key_input or None)
-        system.set_debug(debug_mode)
-
-    system: StoryRAGSystem = st.session_state["rag_system"]
 
     # ---------------- Main content ----------------
     st.markdown("### 🔍 Search for Stories")
@@ -230,8 +244,8 @@ def main() -> None:
                         "explanation": None,
                     }
                 st.session_state["search_results"] = results
-            except Exception as e:
-                st.error(f"Search error: {e}")
+            except Exception as ex:
+                st.error(f"Search error: {ex}")
 
     # ---------------- Results display ----------------
     results = st.session_state["search_results"]
