@@ -2,9 +2,9 @@ import os
 import re
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Optional, Tuple, List
 
-import fitz #Don't add to requirements; covered by pymupdf
+import fitz  #Don't add to requirements; covered by pymupdf
 from tqdm import tqdm
 
 from langchain_core.documents import Document
@@ -110,56 +110,54 @@ def strip_back_matter(text: str) -> str:
 # PDF loading / cleaning with PyMuPDF (fitz)
 # ------------------------------------------------------------
 
-def extract_page_text_fitz(page: "fitz.Page") -> str:
+def extract_page_text_fitz(page: "fitz.Page") -> Tuple[str, Optional[str]]:
     """
-    Extract text from a page using word coordinates and rebuild lines
-    with proper spacing.
+    Extract text from a page using word coordinates and rebuild lines,
+    while capturing potential page numbers.
     """
-    # words: [x0, y0, x1, y1, "text", block_no, line_no, word_no]
     words = page.get_text("words")
     if not words:
-        return ""
+        return "", None
+    
+    # Top margin focus for detecting page numbers
+    top_margin = 50
+    page_number = None
 
-    # Group words by (block_no, line_no)
     lines_by_key = {}
-    for x0, y0, x1, y1, txt, block_no, line_no, word_no in words:
-        key = (block_no, line_no)
+    for x0, y0, x1, y1, txt, _, line_no, _ in words:
+        if y0 < top_margin and txt.isdigit():
+            page_number = txt  # Capture the page number
+        key = (y0, line_no)
         lines_by_key.setdefault(key, []).append((x0, txt))
 
-    # Sort lines in reading order: by block, then line
+    # Sort lines in reading order: by vertical position and then by line
     sorted_lines = sorted(lines_by_key.items(), key=lambda kv: (kv[0][0], kv[0][1]))
 
     text_lines = []
-    for (_block, _line), items in sorted_lines:
-        # sort words left-to-right
-        items.sort(key=lambda t: t[0])
-        words_only = [w for _, w in items]
-
-        # join words with a space; this is what fixes the smashed-together problem
-        line_text = " ".join(words_only).strip()
+    for (_, _line), items in sorted_lines:
+        items.sort(key=lambda t: t[0])  # Sort words left-to-right
+        line_text = " ".join(w for _, w in items).strip()
         if line_text:
             text_lines.append(line_text)
 
-    # join lines with newline
-    return "\n".join(text_lines)
+    extracted_text = "\n".join(text_lines)
+    
+    return extracted_text, page_number  # Return both text and page number
 
 
-def extract_pdf_text_fitz(pdf_path: str) -> str:
+def extract_pdf_text_fitz(pdf_path: str) -> List[Tuple[str, Optional[str]]]:
     """
-    Read a whole PDF with PyMuPDF and return raw text with
-    reasonable line breaks and spaces.
+    Read a whole PDF with PyMuPDF and return list of tuple (text, page number).
     """
     doc = fitz.open(pdf_path)
-    pages_text = []
+    pages_data = []
 
     for page in doc:
-        page_text = extract_page_text_fitz(page)
+        page_text, page_number = extract_page_text_fitz(page)
         if page_text:
-            pages_text.append(page_text)
-
-    # Separate pages with a blank line so your splitter can see boundaries
-    full_text = "\n\n".join(pages_text)
-    return full_text.strip()
+            pages_data.append((page_text, page_number))
+    
+    return pages_data  # Return list of tuples (text, page number)
 
 
 def clean_pdf_text(text: str) -> str:
@@ -186,7 +184,7 @@ def clean_pdf_text(text: str) -> str:
     return cleaned.strip()
 
 
-def load_pdfs_from_directory(pdf_dir: str) -> List[Tuple[str, str]]:
+def load_pdfs_from_directory(pdf_dir: str) -> List[Tuple[str, List[Tuple[str, Optional[str]]]]]:
     """
     Return list of (file_path, cleaned_text) for every PDF in the directory,
     using PyMuPDF (fitz) for extraction.
@@ -202,23 +200,29 @@ def load_pdfs_from_directory(pdf_dir: str) -> List[Tuple[str, str]]:
         logger.warning("No PDFs found in '%s'.", pdf_dir)
         return []
 
-    results: List[Tuple[str, str]] = []
+    results = []
 
     logger.info("Found %d PDF files in '%s'", len(pdf_files), pdf_dir)
 
     for pdf_path in pdf_files:
         try:
             logger.info("Reading (fitz) %s", pdf_path.name)
-            raw_text = extract_pdf_text_fitz(str(pdf_path))
-            cleaned_text = clean_pdf_text(raw_text)
-            cleaned_text = strip_back_matter(cleaned_text)
+            pages_data = extract_pdf_text_fitz(str(pdf_path))
 
-            if cleaned_text:
-                results.append((str(pdf_path), cleaned_text))
+            # Process page data to clean and optionally include page numbers
+            cleaned_pages = []
+            for text, page_number in pages_data:
+                cleaned_text = clean_pdf_text(text)
+                cleaned_text = strip_back_matter(cleaned_text)
+                
+                cleaned_pages.append((cleaned_text, page_number))
+                
+            if cleaned_pages:
+                results.append((str(pdf_path), cleaned_pages))
             else:
                 logger.warning("No extractable text in '%s'", pdf_path.name)
 
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             logger.error("Error loading '%s' with fitz: %s", pdf_path.name, e)
 
     logger.info("Successfully loaded text from %d/%d PDFs", len(results), len(pdf_files))
@@ -272,7 +276,7 @@ def _infer_story_title(chunk_text: str, book_name: str, index: int) -> str:
     return f"{book_name} – Story segment {index + 1}"
 
 
-def build_story_documents(pdf_texts: List[Tuple[str, str]]) -> List[Document]:
+def build_story_documents(pdf_texts: List[Tuple[str, List[Tuple[str, Optional[str]]]]]) -> List[Document]:
     """
     Turn (file_path, text) pairs into a list of LangChain Documents
     with useful metadata: book_name, story_title, source_file, etc.
@@ -283,45 +287,68 @@ def build_story_documents(pdf_texts: List[Tuple[str, str]]) -> List[Document]:
         chunk_overlap=100,
         separators=["\n\n\n", "\n\n", "\n", " ", ""],
     )
-
-    documents: List[Document] = []
+    
+    documents = []
     chunk_counter = 0
+    skipped_counter = 0
+    MIN_CHUNK_SIZE = 10  # Minimum characters required for a chunk to be included
 
-    for file_path, text in pdf_texts:
+    for file_path, pages_data in pdf_texts:
         book_name = _guess_book_name_from_path(file_path)
+        prev_known_page = None  # Track previous known page number for this PDF
 
-        chunks = splitter.split_text(text)
-        logger.info(
-            "Split '%s' into %d chunks", Path(file_path).name, len(chunks)
-        )
+        for page_text, page_number in pages_data:
 
-        for idx, chunk in enumerate(chunks):
-            story_title = _infer_story_title(chunk, book_name, idx)
+            # Use fallback: if no page number detected, use previous known page
+            if page_number is None:
+                page_number = prev_known_page
+            else:
+                # Update the previous known page when we find a new one
+                prev_known_page = page_number
 
-            # DEBUG: show chunk content and title guess
+            chunks = splitter.split_text(page_text)
             logger.info(
-                "  [Chunk %d] %d chars | title guess: %r",
-                chunk_counter,
-                len(chunk),
-                story_title,
+                "Split '%s' into %d chunks", Path(file_path).name, len(chunks)
             )
-            logger.info("-" * 40)
-            preview = chunk[:500].replace("\n", " ")
-            logger.info("%s", preview)
-            logger.info("-" * 40)
 
-            metadata = {
-                "source_file": str(Path(file_path).name),
-                "book_name": book_name,
-                "story_title": story_title,
-                # page is approximate / unknown at this level
-                "page": None,
-                "chunk_id": idx,
-            }
+            for idx, chunk in enumerate(chunks):
+                # Skip chunks that are too small (e.g., single characters)
+                chunk_stripped = chunk.strip()
+                if len(chunk_stripped) < MIN_CHUNK_SIZE:
+                    skipped_counter += 1
+                    logger.debug(
+                        "Skipping chunk %d (too small: %d chars): %r",
+                        chunk_counter,
+                        len(chunk_stripped),
+                        chunk_stripped[:50],
+                    )
+                    continue
+                
+                story_title = _infer_story_title(chunk, book_name, idx)
 
-            documents.append(Document(page_content=chunk, metadata=metadata))
-            chunk_counter += 1
+                # DEBUG: show chunk content and title guess
+                logger.info(
+                    "  [Chunk %d] %d chars | title guess: %r",
+                    chunk_counter,
+                    len(chunk),
+                    story_title,
+                )
+                logger.info("-" * 40)
+                preview = chunk[:500].replace("\n", " ")
+                logger.info("%s", preview)
+                logger.info("-" * 40)
+                
+                metadata = {
+                    "source_file": str(Path(file_path).name),
+                    "book_name": book_name,
+                    "story_title": story_title,
+                    "page": page_number,  # Store None if no page number found, not "Unknown page"
+                    "chunk_id": idx,
+                }
 
+                documents.append(Document(page_content=chunk, metadata=metadata))
+                chunk_counter += 1
+    
     logger.info("Built %d total chunks from %d PDFs", len(documents), len(pdf_texts))
     return documents
 

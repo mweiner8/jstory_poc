@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------
-# Prompt templates (also used for debug printing)
+# Prompt templates
 # --------------------------------------------------------
 
 QA_PROMPT_TEMPLATE = """You are a helpful assistant answering questions about a collection of Jewish stories.
@@ -45,15 +45,45 @@ In 3–6 sentences, explain the main themes that connect these stories to the qu
 Do NOT invent details that are not in the context.
 """
 
+CHAT_PROMPT_TEMPLATE = """You are a helpful assistant discussing a single Jewish story with the user.
+
+You must use ONLY the story text as your source of facts.
+If the user asks about things not in the story, say
+"I don't know from this story."
+
+Story title: {title}
+Book: {book}
+Page: {page}
+Source file: {source_file}
+
+Story text:
+{story_text}
+
+Conversation so far:
+{conversation}
+
+User's latest message:
+{latest_user_message}
+
+In 2–5 sentences, reply helpfully and concretely while staying grounded in the story text.
+"""
+
 
 def _format_docs_for_context(docs: List[Any]) -> str:
     """Turn retrieved docs into a big text block for the LLM."""
     parts: List[str] = []
+    prev_page_num = None  # Initialize the previous page number
     for i, doc in enumerate(docs, start=1):
         meta = doc.metadata or {}
         book = meta.get("book_name", "Unknown book")
         title = meta.get("story_title", "Untitled story")
         page = meta.get("page", None)
+
+        # Use the previous page number if page is not available
+        if page is None:
+            page = prev_page_num
+        else:
+            prev_page_num = page  # Update the previous page number if page is available
 
         header_bits = [f"{i}. {title} ({book})"]
         if page is not None:
@@ -67,18 +97,30 @@ def _format_docs_for_context(docs: List[Any]) -> str:
     return "\n".join(parts).strip()
 
 
+def _conversation_to_text(messages: List[Dict[str, str]]) -> str:
+    """
+    Convert a list of {"role": "user"/"assistant", "content": "..."} messages
+    into a simple text transcript for the prompt.
+    """
+    parts: List[str] = []
+    for m in messages:
+        role = m.get("role", "user")
+        prefix = "User" if role == "user" else "Assistant"
+        parts.append(f"{prefix}: {m.get('content', '')}")
+    return "\n".join(parts).strip()
+
+
 class StoryRAGSystem:
     """
     Wrapper around:
       - Chroma + sentence-transformer embeddings
-      - Optional OpenAI LLM for explanation / QA
+      - Optional OpenAI LLM for explanation / QA / per-story chat
 
     Public methods:
       - search_stories(query, k)
       - get_story_with_context(query, k)
       - ask_question(question, k)
-
-    If debug=True, prints the exact prompts sent to the LLM.
+      - chat_about_story(story_dict, conversation_history)
     """
 
     def __init__(
@@ -125,6 +167,7 @@ class StoryRAGSystem:
         self.explanation_prompt = ChatPromptTemplate.from_template(
             EXPLANATION_PROMPT_TEMPLATE
         )
+        self.chat_prompt = ChatPromptTemplate.from_template(CHAT_PROMPT_TEMPLATE)
 
         # Chains (only created if LLM is available)
         if self.llm is not None:
@@ -132,9 +175,11 @@ class StoryRAGSystem:
             self._explanation_chain = (
                 self.explanation_prompt | self.llm | StrOutputParser()
             )
+            self._chat_chain = self.chat_prompt | self.llm | StrOutputParser()
         else:
             self._qa_chain = None
             self._explanation_chain = None
+            self._chat_chain = None
 
     # --------------------------------------------------------
     # Utilities
@@ -164,9 +209,11 @@ class StoryRAGSystem:
             self._explanation_chain = (
                 self.explanation_prompt | self.llm | StrOutputParser()
             )
+            self._chat_chain = self.chat_prompt | self.llm | StrOutputParser()
         else:
             self._qa_chain = None
             self._explanation_chain = None
+            self._chat_chain = None
 
     def set_debug(self, debug: bool) -> None:
         """Let the UI flip debug mode on/off."""
@@ -190,11 +237,22 @@ class StoryRAGSystem:
             # We'll convert to a crude "similarity percent" just for display.
             try:
                 distance = float(score)
-                similarity = max(0.0, 1.0 - distance)
+                similarity = max(0.0, ((2.0 - distance) / 2.0))
                 similarity_pct = round(similarity * 100, 1)
+                if self.debug:
+                    print(f"Score: {score}, Distance: {distance}, Similarity: {similarity}, Similarity %: {similarity_pct}")
             except Exception:  # noqa: BLE001
                 distance = float(score)
                 similarity_pct = None
+
+            # Get page number with fallback to previous known page
+            page = meta.get("page")
+            # Handle both None and "Unknown page" string (for backwards compatibility)
+            if page is None or page == "Unknown page":
+                page = prev_known_page
+            else:
+                # Update previous known page when we find a valid one
+                prev_known_page = page
 
             formatted.append(
                 {
@@ -203,7 +261,7 @@ class StoryRAGSystem:
                     "similarity_pct": similarity_pct,
                     "book_name": meta.get("book_name"),
                     "story_title": meta.get("story_title"),
-                    "page": meta.get("page"),
+                    "page": page,
                     "source_file": meta.get("source_file"),
                     "metadata": meta,
                 }
@@ -286,3 +344,77 @@ class StoryRAGSystem:
             "answer": answer,
             "docs": docs,
         }
+
+    # --------------------------------------------------------
+    # Per-story chat ("dive deeper")
+    # --------------------------------------------------------
+
+    def chat_about_story(
+        self,
+        story: Dict[str, Any],
+        conversation: List[Dict[str, str]],
+    ) -> str:
+        """
+        Chat about a *single* story, using only that story as context.
+
+        `story` is one of the dicts returned by `search_stories`.
+        `conversation` is a list of {"role": "user"/"assistant", "content": "..."}.
+
+        Returns the assistant's reply as a plain string.
+        """
+        if not self.has_llm or self._chat_chain is None:
+            raise RuntimeError("LLM not available; cannot use chat_about_story().")
+
+        if not conversation:
+            raise ValueError("conversation must contain at least one user message.")
+
+        latest_user_msg = None
+        for m in reversed(conversation):
+            if m.get("role") == "user":
+                latest_user_msg = m.get("content", "")
+                break
+        if latest_user_msg is None:
+            latest_user_msg = conversation[-1].get("content", "")
+
+        conv_text = _conversation_to_text(conversation)
+
+        title = (
+            story.get("story_title")
+            or story.get("title")
+            or "Untitled story"
+        )
+        book = (
+            story.get("book_name")
+            or story.get("book")
+            or "Unknown book"
+        )
+        page = story.get("page", "?")
+        source_file = story.get("source_file", "Unknown source")
+        story_text = story.get("content", "")
+
+        if self.debug:
+            full_prompt = CHAT_PROMPT_TEMPLATE.format(
+                title=title,
+                book=book,
+                page=page,
+                source_file=source_file,
+                story_text=story_text,
+                conversation=conv_text,
+                latest_user_message=latest_user_msg,
+            )
+            print("\n========== [DEBUG] CHAT PROMPT ==========\n")
+            print(full_prompt)
+            print("\n=========================================\n")
+
+        reply = self._chat_chain.invoke(
+            {
+                "title": title,
+                "book": book,
+                "page": page,
+                "source_file": source_file,
+                "story_text": story_text,
+                "conversation": conv_text,
+                "latest_user_message": latest_user_msg,
+            }
+        )
+        return reply

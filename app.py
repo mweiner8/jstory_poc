@@ -22,7 +22,7 @@ def load_rag_system():
         system = StoryRAGSystem(
             persist_directory="./chroma_db",
             collection_name="story_collection",
-            openai_api_key=None,  # Will be updated later if provided
+            openai_api_key=None,  # Will be updated later from sidebar
             debug=False,
         )
         print("✅ RAG system initialized successfully!", flush=True)
@@ -33,11 +33,12 @@ def load_rag_system():
         traceback.print_exc()
         return None
 
+
 # Load system at startup (outside any Streamlit widgets)
 try:
     GLOBAL_RAG_SYSTEM = load_rag_system()
     if GLOBAL_RAG_SYSTEM is None:
-        st.error("⚠️ Failed to load RAG system. Check Render logs for details.")
+        st.error("⚠️ Failed to load RAG system. Check logs for details.")
         st.stop()
 except Exception as e:
     st.error(f"⚠️ Critical error loading RAG system: {e}")
@@ -90,6 +91,13 @@ st.markdown(
 if "search_results" not in st.session_state:
     st.session_state["search_results"] = None
 
+# For per-story chat "dive deeper"
+if "active_story_idx" not in st.session_state:
+    st.session_state["active_story_idx"] = None
+
+if "chat_history" not in st.session_state:
+    st.session_state["chat_history"] = []  # list of {"role": ..., "content": ...}
+
 
 # ------------------------------------------------------------
 # Helpers
@@ -101,7 +109,7 @@ def display_story(story: dict, index: int) -> None:
     if distance is not None:
         similarity = story.get(
             "similarity_pct",
-            max(0, min(100, (1.5 - distance) / 1.5 * 100)),
+            max(0, min(100, ((2.0 - distance) / 2.0) * 100)),
         )
     else:
         similarity = story.get("similarity_pct", 0.0)
@@ -119,7 +127,11 @@ def display_story(story: dict, index: int) -> None:
     )
 
     page = story.get("page")
-    page_display = page if page not in (None, "", -1) else "?"
+    # Handle None, empty string, "Unknown page" string, or -1
+    if page is None or page == "" or page == "Unknown page" or page == -1:
+        page_display = "?"
+    else:
+        page_display = page
 
     content = story.get("content", "")
 
@@ -144,6 +156,14 @@ def display_story(story: dict, index: int) -> None:
         st.write(content)
 
 
+def reset_chat_for_story(story_idx: int) -> None:
+    """
+    Select a new story for 'dive deeper' chat and reset chat history.
+    """
+    st.session_state["active_story_idx"] = story_idx
+    st.session_state["chat_history"] = []
+
+
 # ------------------------------------------------------------
 # Main app
 # ------------------------------------------------------------
@@ -155,8 +175,11 @@ def main() -> None:
         "collection using embeddings + a vector database."
     )
 
-    # Get the cached system
-    system = GLOBAL_RAG_SYSTEM
+    # Use the globally cached RAG system
+    system: StoryRAGSystem = GLOBAL_RAG_SYSTEM
+    if system is None:
+        st.error("RAG system is not available.")
+        st.stop()
 
     # ---------------- Sidebar: settings ----------------
     with st.sidebar:
@@ -168,7 +191,10 @@ def main() -> None:
             "OpenAI API Key (optional)",
             type="password",
             value=default_key,
-            help="For AI explanations and QA. Leave empty for retrieval-only search.",
+            help=(
+                "For AI explanations, QA, and per-story chat. "
+                "Leave empty for retrieval-only search."
+            ),
         )
 
         top_k = st.slider(
@@ -184,7 +210,7 @@ def main() -> None:
             value=False,
         )
 
-        # Update system settings
+        # Update system settings live
         system.update_openai_key(openai_key_input or None)
         system.set_debug(debug_mode)
 
@@ -202,7 +228,7 @@ def main() -> None:
             - **LangChain**: RAG orchestration  
             - **ChromaDB**: Vector database  
             - **HuggingFace**: Embeddings  
-            - **OpenAI** (optional): Explanations & QA  
+            - **OpenAI** (optional): Explanations, QA & per-story chat  
             - **Streamlit**: Web interface
             """
         )
@@ -244,8 +270,11 @@ def main() -> None:
                         "explanation": None,
                     }
                 st.session_state["search_results"] = results
-            except Exception as ex:
-                st.error(f"Search error: {ex}")
+                # Reset per-story chat when doing a new search
+                st.session_state["active_story_idx"] = None
+                st.session_state["chat_history"] = []
+            except Exception as e:
+                st.error(f"Search error: {e}")
 
     # ---------------- Results display ----------------
     results = st.session_state["search_results"]
@@ -265,7 +294,18 @@ def main() -> None:
             st.warning("No stories were retrieved from the vector database.")
         else:
             for i, story in enumerate(stories, 1):
+                # Display the story card
                 display_story(story, i)
+
+                # "Dive deeper" button for this story
+                if system.has_llm:
+                    if st.button(
+                        "💬 Dive deeper with this story",
+                        key=f"dive_{i}",
+                    ):
+                        reset_chat_for_story(i - 1)
+                else:
+                    st.caption("Connect an OpenAI key in the sidebar to enable chat.")
 
             # JSON export
             st.markdown("---")
@@ -277,6 +317,71 @@ def main() -> None:
                 mime="application/json",
                 data=json_str,
             )
+
+        # ---------------- Per-story chat section ----------------
+        active_idx = st.session_state["active_story_idx"]
+        if active_idx is not None and 0 <= active_idx < len(stories):
+            st.markdown("---")
+            st.markdown("### 💬 Chatbot: Dive deeper into a specific story")
+
+            if not system.has_llm:
+                st.info("Connect an OpenAI key in the sidebar to enable the chatbot.")
+            else:
+                active_story = stories[active_idx]
+
+                title = (
+                    active_story.get("story_title")
+                    or active_story.get("title")
+                    or "Untitled story"
+                )
+                book = (
+                    active_story.get("book_name")
+                    or active_story.get("book")
+                    or "Unknown book"
+                )
+                page = active_story.get("page", "?")
+
+                st.markdown(
+                    f"**Currently chatting about:** *{title}* "
+                    f"from **{book}** (page {page})"
+                )
+
+                # Show chat history
+                for msg in st.session_state["chat_history"]:
+                    with st.chat_message(msg["role"]):
+                        st.write(msg["content"])
+
+                # Chat input
+                user_msg = st.chat_input(
+                    "Ask a question or share a thought about this story"
+                )
+
+                if user_msg:
+                    # Append user message
+                    st.session_state["chat_history"].append(
+                        {"role": "user", "content": user_msg}
+                    )
+
+                    try:
+                        with st.spinner("Thinking about this story..."):
+                            reply = system.chat_about_story(
+                                active_story,
+                                st.session_state["chat_history"],
+                            )
+                    except Exception as e:
+                        reply = f"Error during chat: {e}"
+
+                    # Append assistant reply
+                    st.session_state["chat_history"].append(
+                        {"role": "assistant", "content": reply}
+                    )
+
+                    # Immediately display last turn so user sees it without rerun confusion
+                    with st.chat_message("user"):
+                        st.write(user_msg)
+
+                    with st.chat_message("assistant"):
+                        st.write(reply)
 
 
 if __name__ == "__main__":
