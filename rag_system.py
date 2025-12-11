@@ -231,6 +231,7 @@ class StoryRAGSystem:
         results = self.vectordb.similarity_search_with_score(query, k=k)
 
         formatted: List[Dict[str, Any]] = []
+        prev_known_page = None
         for doc, score in results:
             meta = doc.metadata or {}
             # Chroma uses distance; smaller is better.
